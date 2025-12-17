@@ -181,22 +181,25 @@ class Initializer:
 
     def _load_single_tool(self, root: str, import_path: str, agentflow_dir: str) -> Dict[str, Any]:
         """
-        Load a single tool and return its metadata.
+        Load all tools from a single module and return their metadata.
         This method is designed to be called in parallel.
 
+        Note: A single module may contain multiple tool classes (either defined locally or imported).
+
         Returns:
-            Dict with tool metadata or None if loading failed
+            Dict with lists of tool metadata/instances, or error information
         """
-        result = {'metadata': None, 'instance': None, 'error': None}
+        result = {'metadata_list': [], 'instance_list': [], 'errors': []}
 
         try:
             module = importlib.import_module(import_path)
+            current_dir_name = os.path.basename(root)
+
             for name, obj in inspect.getmembers(module):
                 if inspect.isclass(obj) and name.endswith('Tool') and name != 'BaseTool':
                     try:
                         # Check if the tool requires specific llm engine
                         tool_index = -1
-                        current_dir_name = os.path.basename(root)
                         for i, tool_name in enumerate(self.enabled_tools):
                             # First check short_to_long mapping
                             if hasattr(self, 'tool_name_mapping'):
@@ -242,16 +245,14 @@ class Initializer:
                             'require_llm_engine': getattr(obj, 'require_llm_engine', False),
                         }
 
-                        result['metadata'] = (metadata_key, metadata)
-                        result['instance'] = (metadata_key, tool_instance)
-                        return result
+                        result['metadata_list'].append((metadata_key, metadata))
+                        result['instance_list'].append((metadata_key, tool_instance))
 
                     except Exception as e:
-                        result['error'] = f"Error instantiating {name}: {str(e)}"
-                        return result
+                        result['errors'].append(f"Error instantiating {name}: {str(e)}")
 
         except Exception as e:
-            result['error'] = f"Error loading module {import_path}: {str(e)}"
+            result['errors'].append(f"Error loading module {import_path}: {str(e)}")
 
         return result
 
@@ -285,65 +286,89 @@ class Initializer:
         print(f"\n==> Tool name mapping (short to long): {self.tool_name_mapping.get('short_to_long', {})}")
         print(f"==> Tool name mapping (long to internal): {self.tool_name_mapping.get('long_to_internal', {})}")
 
-        # Collect all tool directories to process
+        # Collect all tool directories to process, maintaining the order from available_tools
         tool_dirs_to_process = []
-        for root, dirs, files in os.walk(tools_dir):
-            if 'tool.py' in files and (self.load_all or os.path.basename(root) in self.available_tools):
-                file = 'tool.py'
-                module_path = os.path.join(root, file)
-                relative_path = os.path.relpath(module_path, agentflow_dir)
-                import_path = '.'.join(os.path.split(relative_path)).replace(os.sep, '.')[:-3]
-                tool_dirs_to_process.append((root, import_path))
+
+        if self.load_all:
+            # If loading all tools, use os.walk order
+            for root, dirs, files in os.walk(tools_dir):
+                if 'tool.py' in files:
+                    file = 'tool.py'
+                    module_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(module_path, agentflow_dir)
+                    import_path = '.'.join(os.path.split(relative_path)).replace(os.sep, '.')[:-3]
+                    tool_dirs_to_process.append((root, import_path))
+        else:
+            # Build a map of directory names to paths for efficient lookup
+            dir_to_paths = {}
+            for root, dirs, files in os.walk(tools_dir):
+                if 'tool.py' in files:
+                    dir_name = os.path.basename(root)
+                    file = 'tool.py'
+                    module_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(module_path, agentflow_dir)
+                    import_path = '.'.join(os.path.split(relative_path)).replace(os.sep, '.')[:-3]
+                    dir_to_paths[dir_name] = (root, import_path)
+
+            # Process in the order of available_tools (which matches enabled_tools order)
+            for tool_dir in self.available_tools:
+                if tool_dir in dir_to_paths:
+                    tool_dirs_to_process.append(dir_to_paths[tool_dir])
+                else:
+                    print(f"⚠️  Warning: Tool directory '{tool_dir}' not found in tools directory")
 
         if parallel and len(tool_dirs_to_process) > 1:
             # Parallel loading
-            print(f"\n==> Loading {len(tool_dirs_to_process)} tools in parallel...")
+            print(f"\n==> Loading {len(tool_dirs_to_process)} tool modules in parallel...")
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all tool loading tasks
-                future_to_path = {
-                    executor.submit(self._load_single_tool, root, import_path, agentflow_dir): import_path
+                # Submit all tool loading tasks and maintain order
+                futures = [
+                    (executor.submit(self._load_single_tool, root, import_path, agentflow_dir), import_path)
                     for root, import_path in tool_dirs_to_process
-                }
+                ]
 
-                # Process results as they complete
-                for future in as_completed(future_to_path):
-                    import_path = future_to_path[future]
+                # Wait for all to complete, then process in original order
+                print(f"⏳ Waiting for all {len(futures)} modules to load...")
+
+                # Process results in the original submission order
+                for future, import_path in futures:
                     try:
                         result = future.result()
-                        if result['error']:
-                            print(f"Error loading {import_path}: {result['error']}")
-                        elif result['metadata'] and result['instance']:
-                            metadata_key, metadata = result['metadata']
-                            instance_key, instance = result['instance']
 
-                            # Cache the tool instance
-                            self.tool_instances_cache[instance_key] = instance
-                            print(f"✓ Loaded: {metadata_key} with engine: {getattr(instance, 'model_string', 'default')}")
+                        # Report any errors
+                        if result['errors']:
+                            for error in result['errors']:
+                                print(f"Error loading {import_path}: {error}")
 
-                            # Store metadata
+                        # Process all tools found in this module (in the order they appear in the module)
+                        for metadata_key, metadata in result['metadata_list']:
                             self.toolbox_metadata[metadata_key] = metadata
+
+                        for instance_key, instance in result['instance_list']:
+                            self.tool_instances_cache[instance_key] = instance
+                            print(f"✓ Loaded: {instance_key} with engine: {getattr(instance, 'model_string', 'default')}")
                     except Exception as e:
                         print(f"Exception loading {import_path}: {str(e)}")
         else:
             # Serial loading (original behavior)
-            print(f"\n==> Loading {len(tool_dirs_to_process)} tools serially...")
+            print(f"\n==> Loading {len(tool_dirs_to_process)} tool modules serially...")
             for root, import_path in tool_dirs_to_process:
                 print(f"\n==> Attempting to import: {import_path}")
                 result = self._load_single_tool(root, import_path, agentflow_dir)
 
-                if result['error']:
-                    print(f"Error: {result['error']}")
-                elif result['metadata'] and result['instance']:
-                    metadata_key, metadata = result['metadata']
-                    instance_key, instance = result['instance']
+                # Report any errors
+                if result['errors']:
+                    for error in result['errors']:
+                        print(f"Error: {error}")
 
-                    # Cache the tool instance
-                    self.tool_instances_cache[instance_key] = instance
-                    print(f"Cached tool instance: {metadata_key} with engine: {getattr(instance, 'model_string', 'default')}")
-
-                    # Store metadata
+                # Process all tools found in this module
+                for metadata_key, metadata in result['metadata_list']:
                     self.toolbox_metadata[metadata_key] = metadata
-                    print(f"Metadata for {metadata_key}: {self.toolbox_metadata[metadata_key]}")
+                    print(f"Metadata for {metadata_key}: {metadata}")
+
+                for instance_key, instance in result['instance_list']:
+                    self.tool_instances_cache[instance_key] = instance
+                    print(f"Cached tool instance: {instance_key} with engine: {getattr(instance, 'model_string', 'default')}")
 
         elapsed_time = time.time() - start_time
         print(f"\n==> Total number of tools imported: {len(self.toolbox_metadata)} (took {elapsed_time:.2f}s)")
@@ -354,36 +379,45 @@ class Initializer:
         print("\n==> Running demo commands for each tool...")
         self.available_tools = []
 
-        for tool_name, tool_data in self.toolbox_metadata.items():
+        # Process tools in alphabetical order by tool name
+        for tool_name, tool_data in sorted(self.toolbox_metadata.items()):
             print(f"Checking availability of {tool_name}...")
 
             try:
-                # tool_name here is the long external name from metadata
-                # We need to get the internal class name and directory
-                if hasattr(self, 'tool_name_mapping'):
-                    long_to_internal = self.tool_name_mapping.get('long_to_internal', {})
+                # Use the cached tool instance instead of creating a new one
+                # This preserves the engine configuration from load_tools_and_get_metadata
+                if tool_name in self.tool_instances_cache:
+                    tool_instance = self.tool_instances_cache[tool_name]
+                    print(f"✓ Using cached instance with engine: {getattr(tool_instance, 'model_string', 'default')}")
+                else:
+                    # Fallback: create new instance if not in cache
+                    # tool_name here is the long external name from metadata
+                    # We need to get the internal class name and directory
+                    if hasattr(self, 'tool_name_mapping'):
+                        long_to_internal = self.tool_name_mapping.get('long_to_internal', {})
 
-                    if tool_name in long_to_internal:
-                        dir_name = long_to_internal[tool_name]["dir_name"]
-                        class_name = long_to_internal[tool_name]["class_name"]
+                        if tool_name in long_to_internal:
+                            dir_name = long_to_internal[tool_name]["dir_name"]
+                            class_name = long_to_internal[tool_name]["class_name"]
+                        else:
+                            # Fallback to original behavior
+                            dir_name = tool_name.lower().replace('_tool', '')
+                            class_name = tool_name
                     else:
                         # Fallback to original behavior
                         dir_name = tool_name.lower().replace('_tool', '')
                         class_name = tool_name
-                else:
-                    # Fallback to original behavior
-                    dir_name = tool_name.lower().replace('_tool', '')
-                    class_name = tool_name
 
-                # Import the tool module
-                module_name = f"tools.{dir_name}.tool"
-                module = importlib.import_module(module_name)
+                    # Import the tool module
+                    module_name = f"tools.{dir_name}.tool"
+                    module = importlib.import_module(module_name)
 
-                # Get the tool class
-                tool_class = getattr(module, class_name)
+                    # Get the tool class
+                    tool_class = getattr(module, class_name)
 
-                # Instantiate the tool
-                tool_instance = tool_class()
+                    # Instantiate the tool
+                    tool_instance = tool_class()
+                    print(f"⚠️  Created new instance (not in cache)")
 
                 # FIXME This is a temporary workaround to avoid running demo commands
                 self.available_tools.append(tool_name)
@@ -412,18 +446,24 @@ class Initializer:
         short_to_long = self.tool_name_mapping.get('short_to_long', {})
         long_to_internal = self.tool_name_mapping.get('long_to_internal', {})
 
-        for tool in self.enabled_tools:
+        for i, tool in enumerate(self.enabled_tools):
             # If tool is a short name, convert to long name first
             long_name = short_to_long.get(tool, tool)
+            print(f"  [{i}] {tool} -> {long_name}", end="")
 
             # Then get the directory name
             if long_name in long_to_internal:
-                mapped_tools.append(long_to_internal[long_name]["dir_name"])
+                dir_name = long_to_internal[long_name]["dir_name"]
+                mapped_tools.append(dir_name)
+                print(f" -> {dir_name}")
             else:
                 # Fallback to original behavior for unmapped tools
-                mapped_tools.append(tool.lower().replace('_tool', ''))
+                dir_name = tool.lower().replace('_tool', '')
+                mapped_tools.append(dir_name)
+                print(f" -> {dir_name} (fallback)")
 
         self.available_tools = mapped_tools
+        print(f"\n==> Mapped tools (directory names): {mapped_tools}")
 
         # Now load tools and get metadata (with optional parallel loading)
         self.load_tools_and_get_metadata(
